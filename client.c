@@ -1,105 +1,108 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <getopt.h>
 #include <unistd.h>
+#include <getopt.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <pthread.h>
 
 #define BUFFER_SIZE 1024
+#define USERNAME_MAX 8
+#define PASSWORD_MAX 5
 
-// Hilo para recibir e imprimir mensajes provenientes del servidor
+int port = 0;
+char username[USERNAME_MAX + 1];
+char password[PASSWORD_MAX + 1];
+
 void *receive_messages(void *arg) {
-    int sockfd = *(int *)arg;
-    char buffer[BUFFER_SIZE];
+    int sock_fd = *(int *)arg;
+    char rx_buf[BUFFER_SIZE];
 
     while (1) {
-        memset(buffer, 0, sizeof(buffer));
-        int bytes = recv(sockfd, buffer, sizeof(buffer) - 1, 0);
+        int bytes = recv(sock_fd, rx_buf, sizeof(rx_buf) - 1, 0);
         if (bytes <= 0) {
             break;
         }
-        printf("%s", buffer);
+        rx_buf[bytes] = '\0';
+        printf("%s", rx_buf);
         fflush(stdout);
     }
     return NULL;
 }
 
 int main(int argc, char *argv[]) {
-    char host[256] = {0};
-    int port = 0;
-    char username[256] = {0};
-    char password[256] = {0};
-
+    int opt;
     static struct option long_options[] = {
-        {"host",     required_argument, 0, 'h'},
-        {"port",     required_argument, 0, 'p'},
+        {"port", required_argument, 0, 'p'},
         {"username", required_argument, 0, 'u'},
         {"password", required_argument, 0, 'w'},
         {0, 0, 0, 0}
     };
 
-    int opt;
-    int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "", long_options, &option_index)) != -1) {
+    while ((opt = getopt_long(argc, argv, "", long_options, NULL)) != -1) {
         switch (opt) {
-            case 'h': strncpy(host, optarg, sizeof(host) - 1); break;
             case 'p': port = atoi(optarg); break;
-            case 'u': strncpy(username, optarg, sizeof(username) - 1); break;
-            case 'w': strncpy(password, optarg, sizeof(password) - 1); break;
-            default: break;
+            case 'u': strncpy(username, optarg, USERNAME_MAX); username[USERNAME_MAX] = '\0'; break;
+            case 'w': strncpy(password, optarg, PASSWORD_MAX); password[PASSWORD_MAX] = '\0'; break;
+            default: exit(EXIT_FAILURE);
         }
     }
 
-    if (strlen(host) == 0 || port <= 0 || strlen(username) == 0 || strlen(password) == 0) {
-        fprintf(stderr, "Uso: %s --host <host> --port <port> --username <user> --password <pass>\n", argv[0]);
-        return 1;
+    if (port == 0 || strlen(username) == 0 || strlen(password) == 0) {
+        fprintf(stderr, "Usage: %s --port <port> --username <user> --password <pass>\n", argv[0]);
+        exit(EXIT_FAILURE);
     }
 
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (sockfd < 0) {
-        perror("socket failed");
-        return 1;
+    int sock_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server_addr;
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_addr.sin_port = htons(port);
+
+    if (connect(sock_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
+        perror("Connect failed");
+        exit(EXIT_FAILURE);
     }
 
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    inet_pton(AF_INET, host, &serv_addr.sin_addr);
+    char auth_msg[BUFFER_SIZE];
+    snprintf(auth_msg, sizeof(auth_msg), "%s %s\n", username, password);
+    send(sock_fd, auth_msg, strlen(auth_msg), 0);
 
-    if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("connect failed");
-        close(sockfd);
-        return 1;
+    char response[BUFFER_SIZE];
+    int bytes = recv(sock_fd, response, sizeof(response) - 1, 0);
+    if (bytes <= 0) {
+        close(sock_fd);
+        exit(EXIT_FAILURE);
+    }
+    response[bytes] = '\0';
+
+    if (strcmp(response, "OK\n") != 0) {
+        printf("%s", response);
+        close(sock_fd);
+        exit(EXIT_FAILURE);
     }
 
-    // Enviar credenciales
-    char auth_payload[BUFFER_SIZE];
-    snprintf(auth_payload, sizeof(auth_payload), "%s %s\n", username, password);
-    send(sockfd, auth_payload, strlen(auth_payload), 0);
-
-    printf("Connected to %s on port %d\n", host, port);
-    fflush(stdout);
-
-    // Crear hilo para recibir mensajes del servidor
     pthread_t recv_thread;
-    pthread_create(&recv_thread, NULL, receive_messages, &sockfd);
-    pthread_detach(recv_thread);
+    pthread_create(&recv_thread, NULL, receive_messages, &sock_fd);
 
-    // Bucle para leer de stdin y enviar al servidor
-    char input_buffer[BUFFER_SIZE];
-    while (fgets(input_buffer, sizeof(input_buffer), stdin) != NULL) {
-        send(sockfd, input_buffer, strlen(input_buffer), 0);
-        
-        // Quitar salto de línea para verificar si es exit
-        input_buffer[strcspn(input_buffer, "\r\n")] = 0;
-        if (strcmp(input_buffer, "exit") == 0) {
+    char send_buf[BUFFER_SIZE];
+    while (fgets(send_buf, sizeof(send_buf), stdin) != NULL) {
+        size_t len = strlen(send_buf);
+        if (len > 0 && send_buf[len - 1] == '\n') {
+            send_buf[len - 1] = '\0';
+        }
+
+        char msg_to_send[BUFFER_SIZE + 64];
+        snprintf(msg_to_send, sizeof(msg_to_send), "%s\n", send_buf);
+        send(sock_fd, msg_to_send, strlen(msg_to_send), 0);
+
+        if (strcmp(send_buf, ":Exit") == 0) {
             break;
         }
     }
 
-    close(sockfd);
+    close(sock_fd);
     return 0;
 }
